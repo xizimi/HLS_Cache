@@ -78,6 +78,9 @@ func (c *Cache) RemoveOldest() {
 			break
 		}
 	}
+	if ele := c.ll.Back(); ele != nil {
+		c.RemoveElement(ele)
+	}
 }
 
 // Add adds a value to the cache
@@ -119,4 +122,5 @@ func (c *Cache) RemoveElement(ele *list.Element) {
 	if c.OnEvicted != nil {
 		c.OnEvicted(kv.key, kv.value) //调用对应的回调函数
 	}
+
 }

@@ -29,6 +29,7 @@ type VisitHistory struct {
 
 // A Group is a cache namespace and associated data loaded spread over
 type Group struct {
+	mu sync.RWMutex
 	name      string
 	getter    Getter
 	mainCache cache
@@ -40,6 +41,9 @@ type Group struct {
 	keys   map[string]*KeyStats
 	prefetchHistory map[string]*VisitHistory 
 	videoMetaMap map[string]*VideoMeta 
+	lastDownloadTime time.Time     // 上次下载开始时间
+    currentBandwidth float64       // 当前带宽（MB/s）
+	prefetchSem chan struct{}
 }
 
 type KeyStats struct {
@@ -71,7 +75,7 @@ func (f GetterFunc) Get(key string) ([]byte, error) {
 }
 
 var (
-	mu     sync.RWMutex
+	groupsMu     sync.RWMutex
 	groups = make(map[string]*Group)
 )
 
@@ -81,8 +85,8 @@ func NewGroup(name string, cacheBytes int64, getter Getter) *Group {
 		panic("nil Getter")
 	}
 	const defaultTTL = 5 * time.Minute
-	mu.Lock()
-	defer mu.Unlock()
+	groupsMu.Lock()
+	defer groupsMu.Unlock()
 	g := &Group{
 		name:      name,
 		getter:    getter,
@@ -92,6 +96,7 @@ func NewGroup(name string, cacheBytes int64, getter Getter) *Group {
 		keys:      make(map[string]*KeyStats),
 		prefetchHistory: make(map[string]*VisitHistory),
 		videoMetaMap:    make(map[string]*VideoMeta), 
+		prefetchSem: make(chan struct{}, 20), 
 	}
 	groups[name] = g
 	return g
@@ -100,32 +105,17 @@ func NewGroup(name string, cacheBytes int64, getter Getter) *Group {
 // GetGroup returns the named group previously created with NewGroup, or
 // nil if there's no such group
 func GetGroup(name string) *Group {
-	mu.RLock()
+	groupsMu.RLock()
 	g := groups[name]
-	mu.RUnlock()
+	groupsMu.RUnlock()
 	return g
 }
 
-// Get value for a key from cache
-// func (g *Group) Get(key string) (ByteView, error) {
-// 	if key == "" {
-// 		return ByteView{}, fmt.Errorf("key is required")
-// 	}
-// 	if v, ok := g.hotCache.get(key); ok {
-// 		log.Println("[GeeCache] hot cache hit")
-// 		return v, nil
-// 	}
-// 	if v, ok := g.mainCache.get(key); ok {
-// 		log.Println("[GeeCache] main cache hit")
-// 		return v, nil
-// 	}
-// 	return g.load(key)
-// }
 func (g *Group) Get(key string) (ByteView, error) {
 	if key == "" {
 		return ByteView{}, fmt.Errorf("key is required")
 	}
-	
+	startTime := time.Now()
 	// 1. 检查 HotCache
 	if v, ok := g.hotCache.get(key); ok {
 		log.Println("[GeeCache] hot cache hit")
@@ -147,6 +137,10 @@ func (g *Group) Get(key string) (ByteView, error) {
 	if err != nil {
 		return ByteView{}, err
 	}
+	duration := time.Since(startTime).Seconds()
+	sizeMB := float64(value.Len()) / 1024 / 1024
+	g.currentBandwidth = sizeMB / duration
+	log.Printf("[Network] Downloaded %s, Size: %.2fMB, Time: %.2fs, Speed: %.2fMB/s", key, sizeMB, duration, g.currentBandwidth)
 	go g.checkPrefetch(key)
 	return value, nil
 }
@@ -266,14 +260,16 @@ func (g *Group) getFromPeer(peer PeerGetter, key string) (ByteView, error) {
 
 	return value, nil
 }
-
+func (g *Group) isM3U8(key string) bool {
+    return strings.HasSuffix(key, ".m3u8") || strings.HasSuffix(key, ".mpd")
+}
 func (g *Group) updateKeyStats(key string, value ByteView) {
     var firstGetTime time.Time
     var currentCount int64
     var isNew bool
 
     // --- 阶段 1：仅对 keys map 的读写加锁 (极快) ---
-    mu.Lock()
+    g.mu.Lock()
     if stat, ok := g.keys[key]; ok {
         stat.remoteCnt.Add(1)
         firstGetTime = stat.firstGetTime
@@ -286,7 +282,7 @@ func (g *Group) updateKeyStats(key string, value ByteView) {
         }
         isNew = true
     }
-    mu.Unlock()
+    g.mu.Unlock()
 
     // 如果是首次访问，直接返回，还没资格晋升
     if isNew {
@@ -297,7 +293,7 @@ func (g *Group) updateKeyStats(key string, value ByteView) {
     // 这里调用 isTail，isTail 内部会调用 ensureVideoMeta -> 再次尝试获取 mu
     // 此时 mu 已经释放，所以不会死锁
     threshold := int64(defaultMaxMinuteRemoteQPS)
-    if g.isHead(key) || g.isTail(key) {
+    if g.isHead(key) || g.isTail(key)|| g.isM3U8(key) {
         threshold = threshold / 2
     }
 
@@ -307,9 +303,9 @@ func (g *Group) updateKeyStats(key string, value ByteView) {
     // --- 阶段 3：如果满足条件，晋升并删除统计 ---
     if qps >= threshold {
         g.populateHotCache(key, value)
-        mu.Lock() // 再次加锁仅仅为了删除 map 里的 key
+        g.mu.Lock() // 再次加锁仅仅为了删除 map 里的 key
         delete(g.keys, key)
-        mu.Unlock()
+        g.mu.Unlock()
         log.Printf("[Promotion] Key %s promoted to HotCache (QPS: %d)", key, qps)
     }
 }
@@ -326,11 +322,13 @@ func (g *Group) getLocally(key string) (ByteView, error) {
 }
 
 func (g *Group) populateCache(key string, value ByteView) {
-	g.mainCache.add(key, value)
+	ttl := g.calcTTL(key)
+	g.mainCache.add(key, value, ttl)
 }
 
 func (g *Group) populateHotCache(key string, value ByteView) {
-	g.hotCache.add(key, value)
+	ttl := g.calcTTL(key)
+	g.hotCache.add(key, value, ttl)
 }
 
 // RegisterPeers registers a PeerPicker for choosing remote peer.
@@ -365,9 +363,9 @@ func (g *Group) isTail(key string) bool {
 	g.ensureVideoMeta(vidPrefix)
 
 	// 2. 查询元数据
-	mu.RLock()
+	g.mu.RLock()
 	meta, ok := g.videoMetaMap[vidPrefix]
-	mu.RUnlock()
+	g.mu.RUnlock()
 
 	// 如果解析失败（m3u8 不存在），默认不是片尾，防止误判
 	if !ok {
@@ -391,23 +389,21 @@ func (g *Group) getSeq(key string) int {
 
 // checkPrefetch 检查访问序列，触发智能预取
 func (g *Group) checkPrefetch(currentKey string) {
-	// 1. 提取当前 segment 的序号
+	// 提取当前 segment 的序号
 	seq := g.getSeq(currentKey)
 	if seq == -1 {
 		return // 不是 ts segment，不处理
 	}
 
-	// 2. 提取视频 ID (去掉文件名，作为 map 的 key)
-	// 假设 key 格式为: /data/movie1/1080p/segment_10.ts
-	// 我们需要提取 /data/movie1/1080p
+	//  提取视频 ID 
 	lastSlash := strings.LastIndex(currentKey, "/")
 	if lastSlash == -1 {
 		return
 	}
 	vidPrefix := currentKey[:lastSlash]
 
-	// 3. 获取或初始化该视频的访问历史
-	mu.Lock()
+	// 获取或初始化该视频的访问历史
+	g.mu.Lock()
 	hist, exists := g.prefetchHistory[vidPrefix]
 	if !exists {
 		hist = &VisitHistory{last2Seq: [2]int{-1, -1}}
@@ -418,23 +414,51 @@ func (g *Group) checkPrefetch(currentKey string) {
 	prev := hist.last2Seq[1]
 	hist.last2Seq[0] = hist.last2Seq[1]
 	hist.last2Seq[1] = seq
-	mu.Unlock()
-
-	// 4. 判定是否为连续访问 (上一次 + 1 == 当前)
+	g.mu.Unlock()
 	if prev != -1 && prev+1 == seq {
-		// 触发预取：提前加载 seq + 1 和 seq + 2
-		log.Printf("[Prefetch] Sequence detected for %s, prefetching next segments.", vidPrefix)
-		for i := 1; i <= 2; i++ {
-			nextSeq := seq + i
-			// 构造下一个 key 的名字
-			nextKey := fmt.Sprintf("%s/segment_%03d.ts", vidPrefix, nextSeq)
-			
-			// 异步加载 (不阻塞当前请求)
-			go func(k string) {
-				_, _ = g.Get_pred(k) // 调用 Get 会自动处理缓存逻辑
-			}(nextKey)
+        // 根据网速决定预取数量
+        prefetchCount := 2  // 默认2个
+        if g.currentBandwidth > 0 && g.currentBandwidth < 0.5 {
+			return
 		}
-	}
+        if g.currentBandwidth > 10 {       
+            prefetchCount = 5                // 激进预取5个
+            log.Printf("[Adaptive] Fast network (%.2fMB/s), prefetch 5 segments", g.currentBandwidth)
+        } else if g.currentBandwidth > 2 {   // 网速 2-10MB/s
+            prefetchCount = 3                // 正常预取3个
+            log.Printf("[Adaptive] Normal network (%.2fMB/s), prefetch 3 segments", g.currentBandwidth)
+        } else if g.currentBandwidth > 0 {   // 网速 < 2MB/s
+            prefetchCount = 1                // 保守预取1个
+            log.Printf("[Adaptive] Slow network (%.2fMB/s), prefetch only 1 segment", g.currentBandwidth)
+        } else {
+            log.Printf("[Adaptive] Unknown bandwidth, use default prefetch 2")
+        }
+        
+        // 原来的循环 2 改成变量 prefetchCount
+        for i := 1; i <= prefetchCount; i++ {
+            nextSeq := seq + i
+            nextKey := fmt.Sprintf("%s/segment_%03d.ts", vidPrefix, nextSeq)
+			if _, ok := g.mainCache.get(nextKey); ok {
+                continue
+            }
+            if _, ok := g.hotCache.get(nextKey); ok {
+                continue
+            }
+            select {
+    		case g.prefetchSem <- struct{}{}:
+            go func(k string) {
+                // 如果网速慢，预取也放慢（避免抢占带宽）
+					defer func() { <-g.prefetchSem }()
+					if g.currentBandwidth < 1 && g.currentBandwidth > 0 {
+						time.Sleep(500 * time.Millisecond)  // 慢网时延迟500ms再预取
+					}
+					_, _ = g.Get_pred(k)
+				}(nextKey)
+			default:
+				log.Printf("[Prefetch] Semaphore full, skip %s", nextKey)
+    		}
+        }
+    }
 	if len(g.prefetchHistory) > 1000 {
         for k := range g.prefetchHistory {
             delete(g.prefetchHistory, k)
@@ -456,12 +480,12 @@ func (g *Group) StartPrewarmWorker() {
 // runPrewarm 执行具体的预热逻辑
 func (g *Group) runPrewarm() {
     // 策略：确保所有视频的片头（前3个）永远在缓存中（冷启动保护）
-    mu.RLock()
+    g.mu.RLock()
     vidPrefixes := make([]string, 0, len(g.videoMetaMap))
     for vid := range g.videoMetaMap {
         vidPrefixes = append(vidPrefixes, vid)
     }
-    mu.RUnlock()
+    g.mu.RUnlock()
 
     for _, vidPrefix := range vidPrefixes {
         for i := 0; i < 3; i++ {
@@ -472,46 +496,11 @@ func (g *Group) runPrewarm() {
         }
     }
 }
-// ensureVideoMeta 确保视频元数据已加载（懒加载）
-// 支持分布式：使用 g.Get 而不是 g.getter.Get
-// func (g *Group) ensureVideoMeta(vidPrefix string) {
-// 	mu.Lock()
-// 	_, exists := g.videoMetaMap[vidPrefix]
-// 	mu.Unlock()
-
-// 	if exists {
-// 		return // 已经解析过了
-// 	}
-
-// 	// 1. 构造 m3u8 的 key，假设文件名为 index.m3u8
-// 	m3u8Key := fmt.Sprintf("%s/playlist.m3u8", vidPrefix)
-
-// 	// 2. 使用 g.Get 获取内容（会自动处理 Peer 和缓存）
-// 	view, err := g.Get(m3u8Key)
-// 	if err != nil {
-// 		log.Printf("[Meta] Failed to load m3u8 for %s: %v", vidPrefix, err)
-// 		return
-// 	}
-// 	content := view.String()
-
-// 	// 3. 解析 m3u8 内容，统计包含 index(或segment).ts 的行数
-// 	re := regexp.MustCompile(SegmentPrefix + `\d+\.ts`)
-// 	matches := re.FindAllString(content, -1)
-// 	totalCount := len(matches)
-
-// 	if totalCount > 0 {
-// 		mu.Lock()
-// 		g.videoMetaMap[vidPrefix] = &VideoMeta{TotalSegments: totalCount}
-// 		mu.Unlock()
-// 		log.Printf("[Meta] Parsed m3u8 for %s, total segments: %d", vidPrefix, totalCount)
-// 	}
-// }
-// ensureVideoMeta 确保视频元数据已加载（本地文件版，无死锁风险）
 func (g *Group) ensureVideoMeta(vidPrefix string) {
     // 1. 快速检查（加锁）
-    mu.Lock()
+    g.mu.Lock()
     _, exists := g.videoMetaMap[vidPrefix]
-    mu.Unlock()
+    g.mu.Unlock()
 
     if exists {
         return
@@ -519,14 +508,9 @@ func (g *Group) ensureVideoMeta(vidPrefix string) {
 
     // 2. 构造 m3u8 的路径
     m3u8Key := fmt.Sprintf("%s/playlist.m3u8", vidPrefix)
-    
-    // 3. 【关键修改】直接调用底层 Getter (本地文件)，绕过缓存层
-    // 这样不会触发 updateKeyStats，彻底避免了 g.Get -> isTail 的递归调用
     bytes, err := os.ReadFile(m3u8Key)
     
     if err != nil {
-        // 如果本地读不到 m3u8，说明无法判断片尾，默认返回 false 即可
-        // 可以选择打 log，但不应该阻塞业务
         log.Printf("[Meta] Local file not found: %s, skipping meta load", m3u8Key)
         return
     }
@@ -539,12 +523,23 @@ func (g *Group) ensureVideoMeta(vidPrefix string) {
 
     // 5. 只有成功解析出数量，才写入 map
     if totalCount > 0 {
-        mu.Lock()
+        g.mu.Lock()
         g.videoMetaMap[vidPrefix] = &VideoMeta{TotalSegments: totalCount}
-        mu.Unlock()
+        g.mu.Unlock()
         // log.Printf("[Meta] Loaded meta locally for %s, total: %d", vidPrefix, totalCount)
     }
 }
 
-
+func (g *Group) calcTTL(key string) time.Duration {
+	if g.isM3U8(key) {
+		return 30 * time.Minute  // m3u8 索引更新快 分钟
+	}
+	if g.isHead(key) {
+		return 30 * time.Minute // 片头长期保留（提升秒开率）
+	}
+	if g.isTail(key) {
+		return 15 * time.Minute // 片尾保完整性，比中间长
+	}
+	return 5 * time.Minute
+}
 
