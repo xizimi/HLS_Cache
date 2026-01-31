@@ -15,6 +15,7 @@ import (
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -79,8 +80,39 @@ func (s *Server) Get(ctx context.Context, in *pb.Request) (*pb.Response, error) 
 	return resp, nil
 }
 
-// Start 方法负责启动缓存服务，监听指定端口，注册 gRPC 服务至服务器，并在接收到停止信号后关闭服务
+// Start 方法负责启动缓存服务，监听指定端口，注册 gRPC 服务至服务器
 func (s *Server) Start() error {
+	// ----------------- 阶段 1：自动发现 & 构建哈希环 -----------------
+	// 启动时先尝试拉取一次，尽量让第一眼看到的人多一点
+	// log.Println("[Discovery] Start to discover peers from etcd...")
+	cli, err := clientv3.New(defaultEtcdConfig)
+	if err != nil {
+		log.Printf("[Discovery] Failed to connect to etcd: %v", err)
+	} else {
+		// 1. 从 etcd 拉取所有 geecache 开头的 key
+		resp, err := cli.Get(context.Background(), "geecache/", clientv3.WithPrefix())
+		cli.Close() // 拉完赶紧关闭
+		if err == nil {
+			var peers []string
+			for _, kv := range resp.Kvs {
+				addr := strings.TrimPrefix(string(kv.Key), "geecache/")
+				peers = append(peers, addr)
+			}
+
+			// 2. 【关键】手动把自己加进去（防止此时 etcd 里还没自己）
+			peers = append(peers, s.self)
+
+			// 3. 把完整的列表喂给一致性哈希，建立连接
+			if len(peers) > 0 {
+				s.Set(peers...)
+				// log.Printf("[Discovery] Success! Peers loaded: %v\n", peers)
+			}
+		} else {
+			log.Printf("[Discovery] Failed to get keys from etcd: %v", err)
+		}
+	}
+	// -----------------------------------------------------------------
+
 	s.mu.Lock()
 	if s.status == true {
 		s.mu.Unlock()
@@ -91,9 +123,6 @@ func (s *Server) Start() error {
 	// 2. 初始化stop channel, 这用于通知registry stop keep alive
 	// 3. 初始化tcp socket并开始监听
 	// 4. 注册rpc服务至grpc 这样grpc收到request可以分发给server处理
-	// 5. 将自己的服务名/Host地址注册至etcd 这样client可以通过etcd
-	//    获取服务Host地址 从而进行通信。这样的好处是client只需知道服务名
-	//    以及etcd的Host即可获取对应服务IP 无需写死至client代码中
 	// ----------------------------------------------
 	s.status = true
 	s.stopSignal = make(chan error)
@@ -105,12 +134,9 @@ func (s *Server) Start() error {
 	}
 	grpcServer := grpc.NewServer()
 	pb.RegisterGroupCacheServer(grpcServer, s)
-	//创建一个新的 gRPC 服务器 grpcServer，然后将当前的 Server 对象 s 注册为 gRPC 服务。
-	//这样，gRPC 服务器就能够处理来自客户端的请求。
 
+	// 启动注册协程：这一步是为了让 OTHER 节点以后能发现我
 	go func() {
-		// 注册服务至 etcd。该操作会一直阻塞，直到停止信号被接收。
-		//当停止信号被接收后，关闭通知通道 s.stopSignal，关闭 TCP 监听端口，并输出日志表示服务已经停止。
 		err := registry.Register("geecache", s.self, s.stopSignal)
 		if err != nil {
 			log.Fatalf(err.Error())
@@ -122,11 +148,58 @@ func (s *Server) Start() error {
 		if err != nil {
 			log.Fatalf(err.Error())
 		}
-		log.Printf("[%s] Revoke service and close tcp socket ok.", s.self)
+		// log.Printf("[%s] Revoke service and close tcp socket ok.", s.self)
 	}()
 
-	s.mu.Unlock()
+	go func() {
+		ticker := time.NewTicker(5 * time.Second) // 每 10 秒同步一次集群视图
+		defer ticker.Stop()
+		for {
+			select {
+			case <-s.stopSignal: // 如果收到停止信号，退出循环
+				log.Println("[UpdatePeers] Stop signal received, exiting update routine.")
+				return
+			case <-ticker.C: // 时间到了，开始干活
+				// log.Println("[UpdatePeers] Syncing peers from etcd...")
 
+				// 1. 连接 etcd
+				updateCli, err := clientv3.New(defaultEtcdConfig)
+				if err != nil {
+					log.Printf("[UpdatePeers] Connect etcd failed: %v", err)
+					continue
+				}
+				defer updateCli.Close()
+				// 2. 拉取最新列表
+				resp, err := updateCli.Get(context.Background(), "geecache/", clientv3.WithPrefix())
+				if err != nil {
+					log.Printf("[UpdatePeers] Get keys failed: %v", err)
+					continue
+				}
+				var peers []string
+				for _, kv := range resp.Kvs {
+					addr := strings.TrimPrefix(string(kv.Key), "geecache/")
+					peers = append(peers, addr)
+				}
+				// 3. 检查自己是否在列表里，双重保险（防止 etcd 里自己掉线了）
+				hasSelf := false
+				for _, p := range peers {
+					if p == s.self {
+						hasSelf = true
+						break
+					}
+				}
+				if !hasSelf {
+					peers = append(peers, s.self)
+				}
+				// 4. 更新哈希环 
+				if len(peers) > 0 {
+					s.Set(peers...)
+					// log.Printf("[UpdatePeers] Updated peer list: %v (count: %d)", peers, len(peers))
+				}
+			}
+		}
+	}()
+	s.mu.Unlock()
 	//启动 gRPC 服务器。grpcServer.Serve(lis) 会阻塞，处理客户端的 gRPC 请求，直到服务器关闭或发生错误。
 	//如果服务器状态为运行状态（s.status 为 true），并且发生了错误，则返回相应的错误。
 	if err := grpcServer.Serve(lis); s.status && err != nil {
@@ -142,8 +215,9 @@ func (s *Server) Set(peers ...string) {
 	s.peers.Add(peers...)
 	s.clients = make(map[string]*Client, len(peers))
 	for _, peer := range peers {
-		service := fmt.Sprintf("geecache-%s", peer)
-		s.clients[peer] = NewClient(service)
+		// service := fmt.Sprintf("geecache/%s", peer)
+		// service := "geecache"
+		s.clients[peer] = NewClient(peer)
 	}
 }
 
@@ -151,9 +225,10 @@ func (s *Server) Set(peers ...string) {
 func (s *Server) PickPeer(key string) (PeerGetter, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	peerAddr := s.peers.Get(key) //根据给定的键 key 选择相应的对等节点的地址 peerAddr
+	lastSlash := strings.LastIndex(key, "/")
+	peerAddr := s.peers.Get(key[:lastSlash]) //根据给定的键 key 选择相应的对等节点的地址 peerAddr
 	if peerAddr == s.self {      //如果选择的节点地址与当前服务器的地址相同，说明该节点就是当前服务器本身
-		log.Printf("ooh! pick myself, I am %s\n", s.self)
+		// log.Printf("ooh! pick myself, I am %s\n", s.self)
 		return nil, false
 	}
 	log.Printf("[cache %s] pick remote peer: %s\n", s.self, peerAddr)
@@ -180,36 +255,46 @@ type Client struct {
 	baseURL string
 }
 
-// Get 方法允许 Client 结构体实例向远程节点发送请求，获取缓存数据，并将响应解码为 pb.Response 结构体。
-func (c *Client) Get(in *pb.Request, out *pb.Response) error {
-	// 创建一个 etcd 客户端
-	cli, err := clientv3.New(defaultEtcdConfig)
-	if err != nil {
-		return err
-	}
-	defer cli.Close()
 
-	//使用etcd客户端发现指定服务（g.baseURL）并建立连接（conn）。如果发现服务或建立连接失败，则返回错误
-	conn, err := registry.EtcdDial(cli, c.baseURL)
+func (c *Client) Get(in *pb.Request, out *pb.Response) error {
+	// 打印一下，确认我们要连谁
+	log.Printf("[Step Direct] Dialing peer: %s\n", c.baseURL)
+
+	// 直接 grpc.Dial 目标 IP，不走 etcd 服务发现
+	conn, err := grpc.Dial(c.baseURL,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithBlock(), // 阻塞直到连上
+	)
 	if err != nil {
+		log.Printf("[Step Direct ERROR] Failed to dial %s: %v\n", c.baseURL, err)
 		return err
 	}
 	defer conn.Close()
 
-	// 创建一个新的 gRPC 客户端，用于与远程节点通信
+	log.Printf("[Step Direct OK] Connected to %s, sending RPC...\n", c.baseURL)
+
+	// 创建 gRPC 客户端存根
 	grpcClient := pb.NewGroupCacheClient(conn)
-	// 创建一个带有10s超时时间的上下文，并使用该上下文发送 gRPC 请求到远程节点
+
+	// 设置超时上下文（比如 10 秒）
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+
+	// 发起 RPC 调用
 	response, err := grpcClient.Get(ctx, in)
 	if err != nil {
+		log.Printf("[gRPC Error] RPC failed: %v\n", err)
 		return fmt.Errorf("reading response body: %v", err)
 	}
+
+	// 解析返回的数据
 	if err = proto.Unmarshal(response.GetValue(), out); err != nil {
 		return fmt.Errorf("decoding response body: %v", err)
 	}
+
 	return nil
 }
+
 
 // NewClient 创建一个远程节点客户端
 func NewClient(service string) *Client {

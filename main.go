@@ -5,23 +5,30 @@ import (
 	"fmt"
 	"geecache"
 	"log"
+	"os"
 	"net/http"
+	"strings"
+	"strconv"
 )
 
-var db = map[string]string{
-	"Tom":  "630",
-	"Jack": "589",
-	"Sam":  "567",
-}
+// var db = map[string]string{
+// 	"Tom":  "630",
+// 	"Jack": "589",
+// 	"Sam":  "567",
+// }
 
 func createGroup() *geecache.Group {
-	return geecache.NewGroup("scores", 2<<10, geecache.GetterFunc(
+	return geecache.NewGroup("scores", 2<<30, geecache.GetterFunc(
 		func(key string) ([]byte, error) {
-			log.Println("[SlowDB] search key", key)
-			if v, ok := db[key]; ok {
-				return []byte(v), nil
+			// log.Printf("[LocalFS] loading file: %s", key)
+			data, err := os.ReadFile(key)
+			if err != nil {
+				if os.IsNotExist(err) {
+					return nil, fmt.Errorf("file not found: %s", key)
+				}
+				return nil, err
 			}
-			return nil, fmt.Errorf("%s not exist", key)
+			return data, nil
 		}))
 }
 
@@ -32,22 +39,87 @@ func startCacheServer(addr string, addrs []string, gee *geecache.Group) {
 	log.Println("geecache is running at", addr)
 	log.Fatal(http.ListenAndServe(addr[7:], peers))
 }
-
 func startAPIServer(apiAddr string, gee *geecache.Group) {
-	http.Handle("/api", http.HandlerFunc(
+	http.Handle("/", http.HandlerFunc(
 		func(w http.ResponseWriter, r *http.Request) {
-			key := r.URL.Query().Get("key")
-			view, err := gee.Get(key)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
+			key := r.URL.Path[1:] 
+			if key == "" || key == "favicon.ico" {
 				return
 			}
-			w.Header().Set("Content-Type", "application/octet-stream")
-			w.Write(view.ByteSlice())
+			view, err := gee.Get(key)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusNotFound)
+				return
+			}
+
+			data := view.ByteSlice()
+			size := int64(len(data))
+			w.Header().Set("Accept-Ranges", "bytes")
+			rangeHeader := r.Header.Get("Range")
+			if rangeHeader == "" {
+				w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+				setContentType(w, key)
+				w.WriteHeader(http.StatusOK)
+				w.Write(data)
+				return
+			}
+			if !strings.HasPrefix(rangeHeader, "bytes=") {
+				http.Error(w, "Invalid Range unit", http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+			
+			byteRange := strings.Split(strings.TrimPrefix(rangeHeader, "bytes="), "-")
+			if len(byteRange) != 2 {
+				http.Error(w, "Invalid Range format", http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+
+			start, err := strconv.ParseInt(byteRange[0], 10, 64)
+			if err != nil {
+				http.Error(w, "Invalid Range start", http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+
+			var end int64
+			if byteRange[1] == "" {
+				end = size - 1 
+			} else {
+				end, err = strconv.ParseInt(byteRange[1], 10, 64)
+				if err != nil {
+					http.Error(w, "Invalid Range end", http.StatusRequestedRangeNotSatisfiable)
+					return
+				}
+			}
+
+			if start >= size || end >= size || start > end {
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", size))
+				http.Error(w, "Range Not Satisfiable", http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+			start=0
+			chunkData := data[start : end+1]
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
+			w.Header().Set("Content-Length", strconv.FormatInt(int64(len(chunkData)), 10))
+			setContentType(w, key)
+			w.WriteHeader(http.StatusPartialContent)
+			w.Write(chunkData)
 		}))
-	log.Println("fontend server is running at", apiAddr)
+
+	log.Println("Frontend server is running at", apiAddr)
 	log.Fatal(http.ListenAndServe(apiAddr[7:], nil))
 }
+
+// 辅助函数：设置 Content-Type
+func setContentType(w http.ResponseWriter, key string) {
+	if strings.HasSuffix(key, ".m3u8") {
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+	} else if strings.HasSuffix(key, ".ts") {
+		w.Header().Set("Content-Type", "video/mp2t")
+	} else {
+		w.Header().Set("Content-Type", "application/octet-stream")
+	}
+}
+
 
 // startCacheServerGrpcEtcd 函数：
 // 创建一个 geecache.Server 实例，该实例用于处理 gRPC 请求并与其他节点通信。
@@ -83,9 +155,9 @@ func main() {
 	flag.BoolVar(&api, "api", false, "Start a api server?")
 	flag.Parse()
 
-	apiAddr := "http://localhost:9999"
+	apiAddr := "http://localhost:9988"
 	addrMap := map[int]string{
-		8001: "127.0.0.1:8001",
+		8004: "127.0.0.1:8004",
 		8002: "127.0.0.1:8002",
 		8003: "127.0.0.1:8003",
 	} //grpc版本（含etcd）
@@ -94,6 +166,7 @@ func main() {
 		addrs = append(addrs, v)
 	}
 	gee := createGroup()
+	gee.StartPrewarmWorker()
 	if api {
 		go startAPIServer(apiAddr, gee)
 	}
