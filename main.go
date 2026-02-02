@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context" 
 	"flag"
 	"fmt"
 	"geecache"
@@ -9,18 +10,40 @@ import (
 	"net/http"
 	"strings"
 	"strconv"
+	"time"
+	"github.com/redis/go-redis/v9"
 )
 
+var redisClient *redis.Client
 // var db = map[string]string{
 // 	"Tom":  "630",
 // 	"Jack": "589",
 // 	"Sam":  "567",
 // }
+func initRedis() {
+    redisClient = redis.NewClient(&redis.Options{
+        Addr:     "127.0.0.1:6379", // 你本地编译运行的 Redis 地址
+        Password: "",               // 无密码
+        DB:       0,
+    })
+
+    ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+    defer cancel()
+    if _, err := redisClient.Ping(ctx).Result(); err != nil {
+        log.Fatalf("无法连接 Redis: %v", err)
+    }
+    log.Println("成功连接到 Redis")
+}
 
 func createGroup() *geecache.Group {
 	return geecache.NewGroup("scores", 2<<30, geecache.GetterFunc(
 		func(key string) ([]byte, error) {
 			// log.Printf("[LocalFS] loading file: %s", key)
+			// ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+            // defer cancel()
+            // if val, err := redisClient.Get(ctx, key).Bytes(); err == nil {
+            //     return val, nil
+            // }
 			data, err := os.ReadFile(key)
 			if err != nil {
 				if os.IsNotExist(err) {
@@ -29,7 +52,7 @@ func createGroup() *geecache.Group {
 				return nil, err
 			}
 			return data, nil
-		}))
+		}),redisClient)
 }
 
 func startCacheServer(addr string, addrs []string, gee *geecache.Group) {
@@ -149,6 +172,7 @@ Get 方法首先尝试从本地缓存中的热点缓存（hotCache）中查找�
 注意：节点刚开始都会注册到etcd。
 */
 func main() {
+	initRedis() 
 	var port int
 	var api bool
 	flag.IntVar(&port, "port", 8001, "GeeCache server port")

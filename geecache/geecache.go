@@ -13,6 +13,9 @@ import (
 	"strconv"
 	"strings"
 	"os"
+	"github.com/redis/go-redis/v9"
+	"context"
+	"errors"
 )
 
 const (
@@ -44,6 +47,9 @@ type Group struct {
 	lastDownloadTime time.Time     // 上次下载开始时间
     currentBandwidth float64       // 当前带宽（MB/s）
 	prefetchSem chan struct{}
+		// 新增：Redis 相关字段
+	redisClient *redis.Client  // 新增
+    redisTTL    time.Duration  // 新增：Redis 数据过期时间
 }
 
 type KeyStats struct {
@@ -78,29 +84,61 @@ var (
 	groupsMu     sync.RWMutex
 	groups = make(map[string]*Group)
 )
+func (g *Group) isOwner(key string) bool {
+	if g.peers == nil {
+		return true // 单机模式，总是 owner
+	}
+	_, ok := g.peers.PickPeer(key)
+	return !ok // PickPeer 返回 false 表示本节点负责
+}
 
 // NewGroup creates a new instance of Group
-func NewGroup(name string, cacheBytes int64, getter Getter) *Group {
-	if getter == nil {
-		panic("nil Getter")
-	}
-	const defaultTTL = 5 * time.Minute
-	groupsMu.Lock()
-	defer groupsMu.Unlock()
-	g := &Group{
-		name:      name,
-		getter:    getter,
-		mainCache: cache{cacheBytes: cacheBytes, ttl: defaultTTL},
-        hotCache:  cache{cacheBytes: cacheBytes / defaultHotCacheRatio, ttl: defaultTTL * 2}, 
-		loader:    &singleflight.Group{},
-		keys:      make(map[string]*KeyStats),
-		prefetchHistory: make(map[string]*VisitHistory),
-		videoMetaMap:    make(map[string]*VideoMeta), 
-		prefetchSem: make(chan struct{}, 20), 
-	}
-	groups[name] = g
-	return g
+// func NewGroup(name string, cacheBytes int64, getter Getter) *Group {
+// 	if getter == nil {
+// 		panic("nil Getter")
+// 	}
+// 	const defaultTTL = 5 * time.Minute
+// 	groupsMu.Lock()
+// 	defer groupsMu.Unlock()
+// 	g := &Group{
+// 		name:      name,
+// 		getter:    getter,
+// 		mainCache: cache{cacheBytes: cacheBytes, ttl: defaultTTL},
+//         hotCache:  cache{cacheBytes: cacheBytes / defaultHotCacheRatio, ttl: defaultTTL * 2}, 
+// 		loader:    &singleflight.Group{},
+// 		keys:      make(map[string]*KeyStats),
+// 		prefetchHistory: make(map[string]*VisitHistory),
+// 		videoMetaMap:    make(map[string]*VideoMeta), 
+// 		prefetchSem: make(chan struct{}, 20), 
+// 	}
+// 	groups[name] = g
+// 	return g
+// }
+func NewGroup(name string, cacheBytes int64, getter Getter, redisClient *redis.Client) *Group {
+    if getter == nil {
+        panic("nil Getter")
+    }
+    const defaultTTL = 5 * time.Minute
+    groupsMu.Lock()
+    defer groupsMu.Unlock()
+    g := &Group{
+        name:      name,
+        getter:    getter,
+        mainCache: cache{cacheBytes: cacheBytes, ttl: defaultTTL},
+        hotCache:  cache{cacheBytes: cacheBytes / defaultHotCacheRatio, ttl: defaultTTL * 2},
+        loader:    &singleflight.Group{},
+        keys:      make(map[string]*KeyStats),
+        prefetchHistory: make(map[string]*VisitHistory),
+        videoMetaMap:    make(map[string]*VideoMeta),
+        prefetchSem: make(chan struct{}, 20),
+        redisClient: redisClient,  // 保存传入的客户端
+        redisTTL:    30 * time.Minute, // 默认30分钟
+    }
+    groups[name] = g
+    return g
 }
+
+// 新增函数：支持 Redis
 
 // GetGroup returns the named group previously created with NewGroup, or
 // nil if there's no such group
@@ -116,23 +154,38 @@ func (g *Group) Get(key string) (ByteView, error) {
 		return ByteView{}, fmt.Errorf("key is required")
 	}
 	startTime := time.Now()
-	// 1. 检查 HotCache
+
+	// 1. HotCache
 	if v, ok := g.hotCache.get(key); ok {
 		log.Println("[GeeCache] hot cache hit")
-		// 可选：命中 HotCache 也可以触发预取检查
-		go g.checkPrefetch(key)
+		if g.isOwner(key) { 
+			go g.checkPrefetch(key)
+		}
 		return v, nil
 	}
-	
-	// 2. 检查 MainCache
+
+	// 2. MainCache
 	if v, ok := g.mainCache.get(key); ok {
 		log.Println("[GeeCache] main cache hit")
-		
 		go g.updateKeyStats(key, v)
-		go g.checkPrefetch(key)
-		
+		if g.isOwner(key) { 
+			go g.checkPrefetch(key)
+		}
 		return v, nil
 	}
+	if g.redisClient != nil {
+        ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+        defer cancel()
+        
+        if data, err := g.redisClient.Get(ctx, key).Bytes(); err == nil {
+            log.Println("[GeeCache] redis cache hit")
+            value := ByteView{b: data}
+            // 回填到本地 MainCache，加速下次访问
+            g.populateCache(key, value)
+            return value, nil
+        }
+    }
+
 	value, err := g.load(key)
 	if err != nil {
 		return ByteView{}, err
@@ -141,7 +194,10 @@ func (g *Group) Get(key string) (ByteView, error) {
 	sizeMB := float64(value.Len()) / 1024 / 1024
 	g.currentBandwidth = sizeMB / duration
 	log.Printf("[Network] Downloaded %s, Size: %.2fMB, Time: %.2fs, Speed: %.2fMB/s", key, sizeMB, duration, g.currentBandwidth)
-	go g.checkPrefetch(key)
+
+	if g.isOwner(key) { 
+		go g.checkPrefetch(key)
+	}
 	return value, nil
 }
 func (g *Group) Get_pred(key string) (ByteView, error) {
@@ -311,9 +367,25 @@ func (g *Group) updateKeyStats(key string, value ByteView) {
 }
 
 
+// func (g *Group) getLocally(key string) (ByteView, error) {
+// 	bytes, err := g.getter.Get(key)
+// 	if err != nil {
+// 		return ByteView{}, err
+// 	}
+// 	value := ByteView{b: cloneBytes(bytes)}
+// 	g.populateCache(key, value)
+// 	return value, nil
+// }
 func (g *Group) getLocally(key string) (ByteView, error) {
 	bytes, err := g.getter.Get(key)
+	var ErrNotFound = errors.New("key not found")
 	if err != nil {
+		if os.IsNotExist(err) {
+			// 缓存一个空值，TTL=60秒
+			empty := ByteView{b: []byte{}}
+			g.mainCache.add(key, empty, 60*time.Second)
+			return empty, ErrNotFound
+		}
 		return ByteView{}, err
 	}
 	value := ByteView{b: cloneBytes(bytes)}
@@ -329,6 +401,18 @@ func (g *Group) populateCache(key string, value ByteView) {
 func (g *Group) populateHotCache(key string, value ByteView) {
 	ttl := g.calcTTL(key)
 	g.hotCache.add(key, value, ttl)
+	if g.redisClient != nil {
+        go func() {
+            ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+            defer cancel()
+            redisTTL := ttl + 10*time.Minute 
+            if err := g.redisClient.Set(ctx, key, value.ByteSlice(), redisTTL).Err(); err != nil {
+                log.Printf("[Redis] 写入失败 %s: %v", key, err)
+            } else {
+                log.Printf("[Redis] 写入成功 %s", key)
+            }
+        }()
+    }
 }
 
 // RegisterPeers registers a PeerPicker for choosing remote peer.
@@ -340,7 +424,7 @@ func (g *Group) RegisterPeers(peers PeerPicker) {
 }
 // 辅助函数：判断是否为片头 (假设 segment_000 到 segment_009 为片头)
 func (g *Group)isHead(key string) bool {
-	matched, _ := regexp.MatchString(`segment_0\d\.ts$`, key)
+	matched, _ := regexp.MatchString(`segment_00\d\.ts$`, key)
 	return matched
 }
 
@@ -490,9 +574,12 @@ func (g *Group) runPrewarm() {
     for _, vidPrefix := range vidPrefixes {
         for i := 0; i < 3; i++ {
             key := fmt.Sprintf("%s/segment_%03d.ts", vidPrefix, i)
-            if _, ok := g.mainCache.get(key); !ok {
-                g.Get_pred(key)
-            }
+            if !g.isOwner(key) {
+				continue
+			}
+			if _, ok := g.mainCache.get(key); !ok {
+				g.Get_pred(key)
+}
         }
     }
 }

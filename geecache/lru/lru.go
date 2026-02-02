@@ -70,16 +70,33 @@ func (c *Cache) Get(key string) (value Value, ok bool) {
 }
 
 // RemoveOldest 函数找到最久未使用且已过期的缓存项，然后将其从缓存中移除。
+// func (c *Cache) RemoveOldest() {
+// 	for ele := c.ll.Back(); ele != nil; ele = ele.Prev() {
+// 		kv := ele.Value.(*entry)
+// 		if kv.expire.Before(time.Now()) {
+// 			c.RemoveElement(ele)
+// 			break
+// 		}
+// 	}
+// 	if ele := c.ll.Back(); ele != nil {
+// 		c.RemoveElement(ele)
+// 	}
+// }
 func (c *Cache) RemoveOldest() {
-	for ele := c.ll.Back(); ele != nil; ele = ele.Prev() {
+	// 第一步：尽可能清理所有过期项（从尾部开始扫）
+	count := 0
+	maxScan := 10 // 避免 O(n) 扫描整个链表
+	for ele := c.ll.Back(); ele != nil && count < maxScan; ele = ele.Prev() {
 		kv := ele.Value.(*entry)
 		if kv.expire.Before(time.Now()) {
 			c.RemoveElement(ele)
-			break
+		} else {
+			break // 因为链表按访问时间排序，前面的更“新”，不会过期
 		}
+		count++
 	}
-	if ele := c.ll.Back(); ele != nil {
-		c.RemoveElement(ele)
+	if c.ll.Len() > 0 {
+		c.RemoveElement(c.ll.Back())
 	}
 }
 
