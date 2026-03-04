@@ -26,7 +26,11 @@ const (
 // server 模块为geecache之间提供通信能力
 // 这样部署在其他机器上的cache可以通过访问server获取缓存
 // 至于找哪台主机 那是一致性哈希的工作了
-
+// type PeerHealth struct {
+//     Healthy     bool
+//     LastSeen    time.Time // 最后一次成功通信时间
+//     FailCount   int       // 连续失败次数
+// }
 var (
 	//这个变量通常用于创建etcd客户端的配置，当你不需要定制化的配置时，可以直接使用 defaultEtcdConfig 这个预定义的配置。
 	defaultEtcdConfig = clientv3.Config{
@@ -44,6 +48,7 @@ type Server struct {
 	mu                               sync.Mutex          //保护共享资源的互斥锁
 	peers                            *consistenthash.Map //一致性哈希（consistent hash）映射，用于确定缓存数据在集群中的分布。
 	clients                          map[string]*Client  //用于存储其他节点的客户端连接。键是其他节点的地址，值是与该节点建立的客户端连接
+	// health map[string]*PeerHealth
 }
 
 // NewServer 创建cache的 Server
@@ -214,11 +219,19 @@ func (s *Server) Set(peers ...string) {
 	s.peers = consistenthash.New(defaultReplicas, nil)
 	s.peers.Add(peers...)
 	s.clients = make(map[string]*Client, len(peers))
+	// for _, peer := range peers {
+	// 	// service := fmt.Sprintf("geecache/%s", peer)
+	// 	// service := "geecache"
+	// 	s.clients[peer] = NewClient(peer)
+	// }
 	for _, peer := range peers {
-		// service := fmt.Sprintf("geecache/%s", peer)
-		// service := "geecache"
-		s.clients[peer] = NewClient(peer)
-	}
+        if peer == s.self {
+            continue
+        }
+        if _, exists := s.clients[peer]; !exists {
+            s.clients[peer] = NewClient(peer)
+        }
+    }
 }
 
 // PickPeer 方法，用于根据给定的键选择相应的对等节点

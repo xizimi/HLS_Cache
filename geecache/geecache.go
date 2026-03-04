@@ -16,13 +16,18 @@ import (
 	"github.com/redis/go-redis/v9"
 	"context"
 	"errors"
+	"github.com/bits-and-blooms/bloom/v3"
 )
 
 const (
 	defaultHotCacheRatio      = 8
 	defaultMaxMinuteRemoteQPS = 3
 	SegmentPrefix = "segment_" 
+	// 布隆过滤器配置
+	bloomExpectedItems = 100000  // 预期元素数量
+	bloomFalsePositiveRate = 0.01 // 误判率 1%
 )
+
 type VideoMeta struct {
 	TotalSegments int // 总共有多少个切片
 }
@@ -44,12 +49,14 @@ type Group struct {
 	keys   map[string]*KeyStats
 	prefetchHistory map[string]*VisitHistory 
 	videoMetaMap map[string]*VideoMeta 
-	lastDownloadTime time.Time     // 上次下载开始时间
-    currentBandwidth float64       // 当前带宽（MB/s）
+	lastDownloadTime time.Time
+    currentBandwidth float64
 	prefetchSem chan struct{}
 		// 新增：Redis 相关字段
-	redisClient *redis.Client  // 新增
-    redisTTL    time.Duration  // 新增：Redis 数据过期时间
+	redisClient *redis.Client
+    redisTTL    time.Duration
+	// 新增：布隆过滤器
+	bloomFilter *bloom.BloomFilter
 }
 
 type KeyStats struct {
@@ -131,8 +138,10 @@ func NewGroup(name string, cacheBytes int64, getter Getter, redisClient *redis.C
         prefetchHistory: make(map[string]*VisitHistory),
         videoMetaMap:    make(map[string]*VideoMeta),
         prefetchSem: make(chan struct{}, 20),
-        redisClient: redisClient,  // 保存传入的客户端
-        redisTTL:    30 * time.Minute, // 默认30分钟
+        redisClient: redisClient,
+        redisTTL:    30 * time.Minute,
+        // 初始化布隆过滤器
+        bloomFilter: bloom.NewWithEstimates(bloomExpectedItems, bloomFalsePositiveRate),
     }
     groups[name] = g
     return g
@@ -377,19 +386,28 @@ func (g *Group) updateKeyStats(key string, value ByteView) {
 // 	return value, nil
 // }
 func (g *Group) getLocally(key string) (ByteView, error) {
+	// 使用布隆过滤器检查 key 是否存在
+	if g.bloomFilter != nil && !g.bloomFilter.Test([]byte(key)) {
+		log.Printf("[BloomFilter] Key %s does not exist (cache penetration prevented)", key)
+		return ByteView{}, errors.New("key not found (bloom filter)")
+	}
+	
 	bytes, err := g.getter.Get(key)
-	var ErrNotFound = errors.New("key not found")
 	if err != nil {
 		if os.IsNotExist(err) {
-			// 缓存一个空值，TTL=60秒
-			empty := ByteView{b: []byte{}}
-			g.mainCache.add(key, empty, 60*time.Second)
-			return empty, ErrNotFound
+			// 布隆过滤器已拦截，这里理论上不会执行到
+			// 但为了安全，仍然记录日志
+			log.Printf("[BloomFilter] False positive for key %s", key)
+			return ByteView{}, errors.New("key not found")
 		}
 		return ByteView{}, err
 	}
 	value := ByteView{b: cloneBytes(bytes)}
 	g.populateCache(key, value)
+	// 成功加载后，将 key 添加到布隆过滤器
+	if g.bloomFilter != nil {
+		g.bloomFilter.Add([]byte(key))
+	}
 	return value, nil
 }
 
@@ -413,6 +431,10 @@ func (g *Group) populateHotCache(key string, value ByteView) {
             }
         }()
     }
+	// 成功加载后，将 key 添加到布隆过滤器
+	if g.bloomFilter != nil {
+		g.bloomFilter.Add([]byte(key))
+	}
 }
 
 // RegisterPeers registers a PeerPicker for choosing remote peer.
@@ -614,6 +636,19 @@ func (g *Group) ensureVideoMeta(vidPrefix string) {
         g.videoMetaMap[vidPrefix] = &VideoMeta{TotalSegments: totalCount}
         g.mu.Unlock()
         // log.Printf("[Meta] Loaded meta locally for %s, total: %d", vidPrefix, totalCount)
+        
+        // 预加载该视频的所有 segment key 到布隆过滤器
+        for i := 0; i < totalCount; i++ {
+            segmentKey := fmt.Sprintf("%s/segment_%03d.ts", vidPrefix, i)
+            if g.bloomFilter != nil {
+                g.bloomFilter.Add([]byte(segmentKey))
+            }
+        }
+        // 也将 m3u8 文件加入布隆过滤器
+        if g.bloomFilter != nil {
+            g.bloomFilter.Add([]byte(m3u8Key))
+        }
+        log.Printf("[BloomFilter] Preloaded %d segments for %s", totalCount, vidPrefix)
     }
 }
 
