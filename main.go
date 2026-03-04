@@ -38,12 +38,6 @@ func initRedis() {
 func createGroup() *geecache.Group {
 	return geecache.NewGroup("scores", 2<<30, geecache.GetterFunc(
 		func(key string) ([]byte, error) {
-			// log.Printf("[LocalFS] loading file: %s", key)
-			// ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-            // defer cancel()
-            // if val, err := redisClient.Get(ctx, key).Bytes(); err == nil {
-            //     return val, nil
-            // }
 			data, err := os.ReadFile(key)
 			if err != nil {
 				if os.IsNotExist(err) {
@@ -184,7 +178,7 @@ func main() {
 		8004: "127.0.0.1:8004",
 		8002: "127.0.0.1:8002",
 		8003: "127.0.0.1:8003",
-	} //grpc版本（含etcd）
+	}
 	var addrs []string
 	for _, v := range addrMap {
 		addrs = append(addrs, v)
@@ -194,5 +188,5 @@ func main() {
 	if api {
 		go startAPIServer(apiAddr, gee)
 	}
-	startCacheServerGrpcEtcd(addrMap[port], addrs, gee) //grpc版本
+	startCacheServerGrpcEtcd(addrMap[port], addrs, gee)
 }
