@@ -113,7 +113,6 @@ func startAPIServer(apiAddr string, gee *geecache.Group) {
 				http.Error(w, "Range Not Satisfiable", http.StatusRequestedRangeNotSatisfiable)
 				return
 			}
-			start=0
 			chunkData := data[start : end+1]
 			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
 			w.Header().Set("Content-Length", strconv.FormatInt(int64(len(chunkData)), 10))

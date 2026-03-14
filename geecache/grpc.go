@@ -39,7 +39,7 @@ var (
 	}
 )
 
-// Server 和 Group 是解耦合的 所以server要自己实现并发控制
+// Server 和 Group 是解耦合的 所以 server 要自己实现并发控制
 type Server struct {
 	pb.UnimplementedGroupCacheServer                     //gRPC 自动生成的代码，用于实现 gRPC 的服务端接口。
 	self                             string              // 当前服务器的地址，format: ip:port
@@ -48,6 +48,9 @@ type Server struct {
 	mu                               sync.Mutex          //保护共享资源的互斥锁
 	peers                            *consistenthash.Map //一致性哈希（consistent hash）映射，用于确定缓存数据在集群中的分布。
 	clients                          map[string]*Client  //用于存储其他节点的客户端连接。键是其他节点的地址，值是与该节点建立的客户端连接
+	// 新增：etcd 客户端和 watch 相关字段
+	etcdClient                       *clientv3.Client
+	watchChan                        clientv3.WatchChan
 	// health map[string]*PeerHealth
 }
 
@@ -94,9 +97,11 @@ func (s *Server) Start() error {
 	if err != nil {
 		log.Printf("[Discovery] Failed to connect to etcd: %v", err)
 	} else {
+		// 保存 etcd 客户端供后续 watch 使用
+		s.etcdClient = cli
+		
 		// 1. 从 etcd 拉取所有 geecache 开头的 key
 		resp, err := cli.Get(context.Background(), "geecache/", clientv3.WithPrefix())
-		cli.Close() // 拉完赶紧关闭
 		if err == nil {
 			var peers []string
 			for _, kv := range resp.Kvs {
@@ -124,10 +129,10 @@ func (s *Server) Start() error {
 		return fmt.Errorf("server already started")
 	}
 	// -----------------启动服务----------------------
-	// 1. 设置status为true 表示服务器已在运行
-	// 2. 初始化stop channel, 这用于通知registry stop keep alive
-	// 3. 初始化tcp socket并开始监听
-	// 4. 注册rpc服务至grpc 这样grpc收到request可以分发给server处理
+	// 1. 设置 status 为 true 表示服务器已在运行
+	// 2. 初始化 stop channel, 这用于通知 registry stop keep alive
+	// 3. 初始化 tcp socket 并开始监听
+	// 4. 注册 rpc 服务至 grpc 这样 grpc 收到 request 可以分发给 server 处理
 	// ----------------------------------------------
 	s.status = true
 	s.stopSignal = make(chan error)
@@ -156,36 +161,55 @@ func (s *Server) Start() error {
 		// log.Printf("[%s] Revoke service and close tcp socket ok.", s.self)
 	}()
 
+	// 新增：使用 etcd Watch 机制监听节点变化
 	go func() {
-		ticker := time.NewTicker(5 * time.Second) // 每 10 秒同步一次集群视图
-		defer ticker.Stop()
+		if s.etcdClient == nil {
+			log.Println("[Watch] etcd client not available, skip watch mechanism")
+			return
+		}
+
+		log.Println("[Watch] Start watching etcd for peer changes...")
+		// 监听 geecache/ 前缀的所有键变化
+		s.watchChan = s.etcdClient.Watch(context.Background(), "geecache/", clientv3.WithPrefix())
+
 		for {
 			select {
 			case <-s.stopSignal: // 如果收到停止信号，退出循环
-				log.Println("[UpdatePeers] Stop signal received, exiting update routine.")
+				log.Println("[Watch] Stop signal received, exiting watch routine.")
 				return
-			case <-ticker.C: // 时间到了，开始干活
-				// log.Println("[UpdatePeers] Syncing peers from etcd...")
+			case watchResp, ok := <-s.watchChan:
+				if !ok {
+					log.Println("[Watch] Watch channel closed, attempting to reconnect...")
+					// watch 连接断开，尝试重新建立连接
+					time.Sleep(2 * time.Second)
+					if s.etcdClient != nil {
+						s.watchChan = s.etcdClient.Watch(context.Background(), "geecache/", clientv3.WithPrefix())
+					}
+					continue
+				}
 
-				// 1. 连接 etcd
-				updateCli, err := clientv3.New(defaultEtcdConfig)
+				// 检测到变化，记录变化类型
+				for _, ev := range watchResp.Events {
+					log.Printf("[Watch] Key %s %s", string(ev.Kv.Key), ev.Type)
+				}
+
+				// 重新拉取最新节点列表
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				resp, err := s.etcdClient.Get(ctx, "geecache/", clientv3.WithPrefix())
+				cancel()
+
 				if err != nil {
-					log.Printf("[UpdatePeers] Connect etcd failed: %v", err)
+					log.Printf("[Watch] Failed to get peers from etcd: %v", err)
 					continue
 				}
-				defer updateCli.Close()
-				// 2. 拉取最新列表
-				resp, err := updateCli.Get(context.Background(), "geecache/", clientv3.WithPrefix())
-				if err != nil {
-					log.Printf("[UpdatePeers] Get keys failed: %v", err)
-					continue
-				}
+
 				var peers []string
 				for _, kv := range resp.Kvs {
 					addr := strings.TrimPrefix(string(kv.Key), "geecache/")
 					peers = append(peers, addr)
 				}
-				// 3. 检查自己是否在列表里，双重保险（防止 etcd 里自己掉线了）
+
+				// 检查自己是否在列表里，双重保险
 				hasSelf := false
 				for _, p := range peers {
 					if p == s.self {
@@ -196,14 +220,16 @@ func (s *Server) Start() error {
 				if !hasSelf {
 					peers = append(peers, s.self)
 				}
-				// 4. 更新哈希环 
+
+				// 更新哈希环
 				if len(peers) > 0 {
 					s.Set(peers...)
-					// log.Printf("[UpdatePeers] Updated peer list: %v (count: %d)", peers, len(peers))
+					log.Printf("[Watch] Updated peer list: %v (count: %d)", peers, len(peers))
 				}
 			}
 		}
 	}()
+
 	s.mu.Unlock()
 	//启动 gRPC 服务器。grpcServer.Serve(lis) 会阻塞，处理客户端的 gRPC 请求，直到服务器关闭或发生错误。
 	//如果服务器状态为运行状态（s.status 为 true），并且发生了错误，则返回相应的错误。
@@ -248,17 +274,24 @@ func (s *Server) PickPeer(key string) (PeerGetter, bool) {
 	return s.clients[peerAddr], true //如果选择的节点不是当前服务器本身，日志会记录当前服务器选择了远程对等节点，并且函数会返回选择的对等节点的客户端连接（s.clients[peerAddr]）和 true，表示选择成功
 }
 
-// Stop 停止server运行 如果server没有运行 这将是一个no-op
+// Stop 停止 server 运行 如果 server 没有运行 这将是一个 no-op
 func (s *Server) Stop() {
 	s.mu.Lock()
 	if s.status == false {
 		s.mu.Unlock()
 		return
 	}
-	s.stopSignal <- nil // 发送停止keepalive信号
-	s.status = false    // 设置server运行状态为stop
+	s.stopSignal <- nil // 发送停止 keepalive 信号
+	s.status = false    // 设置 server 运行状态为 stop
 	s.clients = nil     // 清空一致性哈希信息 有助于垃圾回收
 	s.peers = nil       // 清空一致性哈希映射
+	
+	// 新增：关闭 etcd 客户端连接
+	if s.etcdClient != nil {
+		s.etcdClient.Close()
+		log.Println("[Stop] etcd client closed")
+	}
+	
 	s.mu.Unlock()
 }
 
