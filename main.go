@@ -49,6 +49,23 @@ func createGroup() *geecache.Group {
 		}),redisClient)
 }
 
+// 新增：文件 Getter 实现，支持 Set 和 Delete
+type FileGetter struct {
+	baseDir string
+}
+
+func (f *FileGetter) Get(key string) ([]byte, error) {
+	return os.ReadFile(key)
+}
+
+func (f *FileGetter) Set(key string, value []byte) error {
+	return os.WriteFile(key, value, 0644)
+}
+
+func (f *FileGetter) Delete(key string) error {
+	return os.Remove(key)
+}
+
 func startCacheServer(addr string, addrs []string, gee *geecache.Group) {
 	peers := geecache.NewHTTPPool(addr)
 	peers.Set(addrs...)

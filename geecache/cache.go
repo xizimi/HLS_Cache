@@ -61,3 +61,13 @@ func (c *cache) addWithTTL(key string, value ByteView, ttl time.Duration) {
 	}
 	c.lru.Add(key, value, ttl)
 }
+
+// delete 函数用于从缓存中删除数据
+func (c *cache) delete(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.lru == nil {
+		return
+	}
+	c.lru.Remove(key)
+}

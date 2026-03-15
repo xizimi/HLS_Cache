@@ -16,11 +16,12 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/protobuf/proto"
 )
 
 const (
 	defaultReplicas = 50
+	// 新增：Invalidate RPC 方法全路径
+	invalidateMethod = "/geecachepb.GroupCache/Invalidate"
 )
 
 // server 模块为geecache之间提供通信能力
@@ -79,13 +80,27 @@ func (s *Server) Get(ctx context.Context, in *pb.Request) (*pb.Response, error) 
 	if err != nil {
 		return resp, err
 	}
-	// 将获取到的缓存数据序列化为 protobuf 格式，并存储在响应对象的 Value 字段中
-	body, err := proto.Marshal(&pb.Response{Value: view.ByteSlice()})
-	if err != nil {
-		return resp, err
-	}
-	resp.Value = body
+	// 修复：直接返回数据，不要再次序列化
+	resp.Value = view.ByteSlice()
 	return resp, nil
+}
+
+// 新增：Invalidate 实现缓存失效接口
+func (s *Server) Invalidate(ctx context.Context, in *pb.Request) (*pb.Response, error) {
+	group, key := in.GetGroup(), in.GetKey()
+	log.Printf("[Geecache_svr %s] Recv Invalidate request %s/%s", s.self, group, key)
+	
+	g := GetGroup(group)
+	if g == nil {
+		return &pb.Response{}, fmt.Errorf("group not found")
+	}
+	
+	// 删除本地缓存（不删除 Redis，Redis 由 owner 节点统一删除）
+	g.DeleteLocalCache(key)
+	
+	log.Printf("[Invalidate] 节点 %s 已删除本地缓存 %s（Redis 由 owner 节点删除）", s.self, key)
+	
+	return &pb.Response{}, nil
 }
 
 // Start 方法负责启动缓存服务，监听指定端口，注册 gRPC 服务至服务器
@@ -149,14 +164,14 @@ func (s *Server) Start() error {
 	go func() {
 		err := registry.Register("geecache", s.self, s.stopSignal)
 		if err != nil {
-			log.Fatalf(err.Error())
+			log.Fatalf("%v", err)
 		}
 		// Close channel
 		close(s.stopSignal)
 		// Close tcp listen
 		err = lis.Close()
 		if err != nil {
-			log.Fatalf(err.Error())
+			log.Fatalf("%v", err)
 		}
 		// log.Printf("[%s] Revoke service and close tcp socket ok.", s.self)
 	}()
@@ -299,48 +314,94 @@ var _ PeerPicker = (*Server)(nil)
 
 type Client struct {
 	baseURL string
+	// 新增：连接池，复用 gRPC 连接
+	connPool sync.Map // map[string]*grpc.ClientConn
 }
 
-
-func (c *Client) Get(in *pb.Request, out *pb.Response) error {
-	// 打印一下，确认我们要连谁
-	log.Printf("[Step Direct] Dialing peer: %s\n", c.baseURL)
-
-	// 直接 grpc.Dial 目标 IP，不走 etcd 服务发现
+// 新增：获取或创建连接
+func (c *Client) getConn() (*grpc.ClientConn, error) {
+	if conn, ok := c.connPool.Load(c.baseURL); ok {
+		return conn.(*grpc.ClientConn), nil
+	}
+	
 	conn, err := grpc.Dial(c.baseURL,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithBlock(), // 阻塞直到连上
+		grpc.WithBlock(),
 	)
+	if err != nil {
+		return nil, err
+	}
+	
+	c.connPool.Store(c.baseURL, conn)
+	return conn, nil
+}
+
+// 新增：关闭所有连接
+func (c *Client) Close() {
+	c.connPool.Range(func(key, value interface{}) bool {
+		if conn, ok := value.(*grpc.ClientConn); ok {
+			conn.Close()
+		}
+		c.connPool.Delete(key)
+		return true
+	})
+}
+
+func (c *Client) Get(in *pb.Request, out *pb.Response) error {
+	log.Printf("[Step Direct] Dialing peer: %s\n", c.baseURL)
+
+	conn, err := c.getConn()
 	if err != nil {
 		log.Printf("[Step Direct ERROR] Failed to dial %s: %v\n", c.baseURL, err)
 		return err
 	}
-	defer conn.Close()
 
 	log.Printf("[Step Direct OK] Connected to %s, sending RPC...\n", c.baseURL)
 
-	// 创建 gRPC 客户端存根
 	grpcClient := pb.NewGroupCacheClient(conn)
 
-	// 设置超时上下文（比如 10 秒）
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// 发起 RPC 调用
 	response, err := grpcClient.Get(ctx, in)
 	if err != nil {
 		log.Printf("[gRPC Error] RPC failed: %v\n", err)
 		return fmt.Errorf("reading response body: %v", err)
 	}
 
-	// 解析返回的数据
-	if err = proto.Unmarshal(response.GetValue(), out); err != nil {
-		return fmt.Errorf("decoding response body: %v", err)
-	}
+	out.Value = response.GetValue()
 
 	return nil
 }
 
+// 新增：Invalidate 方法 - 调用远程节点的缓存失效接口
+func (c *Client) Invalidate(key string, group string) error {
+	conn, err := c.getConn()
+	if err != nil {
+		log.Printf("[Invalidate ERROR] Failed to dial %s: %v\n", c.baseURL, err)
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	req := &pb.Request{
+		Group: group,
+		Key:   key,
+	}
+
+	resp := &pb.Response{}
+
+	// 修复：使用 grpc.Invoke 直接调用 RPC，不依赖生成的客户端方法
+	err = conn.Invoke(ctx, invalidateMethod, req, resp)
+	if err != nil {
+		log.Printf("[Invalidate ERROR] RPC failed for key %s: %v\n", key, err)
+		return fmt.Errorf("invalidating cache: %v", err)
+	}
+
+	log.Printf("[Invalidate OK] Successfully invalidated key %s on %s", key, c.baseURL)
+	return nil
+}
 
 // NewClient 创建一个远程节点客户端
 func NewClient(service string) *Client {

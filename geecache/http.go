@@ -138,4 +138,9 @@ func (h *httpGetter) Get(in *pb.Request, out *pb.Response) error {
 	return nil
 }
 
+// 新增：Invalidate 方法实现（HTTP 模式暂不支持，返回错误）
+func (h *httpGetter) Invalidate(key string, group string) error {
+	return fmt.Errorf("Invalidate not supported in HTTP mode, please use gRPC mode")
+}
+
 var _ PeerGetter = (*httpGetter)(nil)

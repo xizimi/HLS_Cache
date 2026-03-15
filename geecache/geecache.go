@@ -50,13 +50,16 @@ type Group struct {
 	prefetchHistory map[string]*VisitHistory 
 	videoMetaMap map[string]*VideoMeta 
 	lastDownloadTime time.Time
-    currentBandwidth float64
+    // 修复：使用 Uint64+Float64bits 替代 Float64，兼容所有 Go 版本
+    currentBandwidth atomic.Uint64
 	prefetchSem chan struct{}
 		// 新增：Redis 相关字段
 	redisClient *redis.Client
     redisTTL    time.Duration
 	// 新增：布隆过滤器
 	bloomFilter *bloom.BloomFilter
+    // 新增：写锁，防止并发写冲突
+    writeMu sync.Map // map[string]*sync.Mutex
 }
 
 type KeyStats struct {
@@ -77,6 +80,9 @@ func (i *AtomicInt) Get() int64 {
 // A Getter loads data for a key
 type Getter interface {
 	Get(key string) ([]byte, error)
+	// 支持数据更新
+	Set(key string, value []byte) error
+	Delete(key string) error
 }
 
 // A GetterFunc implements Getter witha function
@@ -85,6 +91,16 @@ type GetterFunc func(key string) ([]byte, error)
 // Get implements Getter inteface function
 func (f GetterFunc) Get(key string) ([]byte, error) {
 	return f(key)
+}
+
+// 新增：Set 实现（默认不支持，需要自定义 Getter）
+func (f GetterFunc) Set(key string, value []byte) error {
+	return fmt.Errorf("GetterFunc does not support Set operation")
+}
+
+// 新增：Delete 实现（默认不支持，需要自定义 Getter）
+func (f GetterFunc) Delete(key string) error {
+	return fmt.Errorf("GetterFunc does not support Delete operation")
 }
 
 var (
@@ -188,7 +204,7 @@ func (g *Group) Get(key string) (ByteView, error) {
         
         if data, err := g.redisClient.Get(ctx, key).Bytes(); err == nil {
             log.Println("[GeeCache] redis cache hit")
-            value := ByteView{b: data}
+            value := ByteView{b: cloneBytes(data)}
             // 回填到本地 MainCache，加速下次访问
             g.populateCache(key, value)
             return value, nil
@@ -201,38 +217,172 @@ func (g *Group) Get(key string) (ByteView, error) {
 	}
 	duration := time.Since(startTime).Seconds()
 	sizeMB := float64(value.Len()) / 1024 / 1024
-	g.currentBandwidth = sizeMB / duration
-	log.Printf("[Network] Downloaded %s, Size: %.2fMB, Time: %.2fs, Speed: %.2fMB/s", key, sizeMB, duration, g.currentBandwidth)
+	// 修复：使用原子操作更新带宽统计（Uint64+Float64bits）
+	g.currentBandwidth.Store(math.Float64bits(sizeMB / duration))
+	log.Printf("[Network] Downloaded %s, Size: %.2fMB, Time: %.2fs, Speed: %.2fMB/s", key, sizeMB, duration, math.Float64frombits(g.currentBandwidth.Load()))
 
 	if g.isOwner(key) { 
 		go g.checkPrefetch(key)
 	}
 	return value, nil
 }
-func (g *Group) Get_pred(key string) (ByteView, error) {
+
+// 新增：Set 方法 - 更新数据并保持缓存一致性
+func (g *Group) Set(key string, value []byte) error {
 	if key == "" {
-		return ByteView{}, fmt.Errorf("key is required")
+		return fmt.Errorf("key is required")
 	}
 	
-	// 1. 检查 HotCache
-	if v, ok := g.hotCache.get(key); ok {
-		log.Println("[GeeCache] hot cache hit")
-		// 可选：命中 HotCache 也可以触发预取检查
-		return v, nil
+	// 修复：获取该 key 的写锁，防止并发写冲突
+	writeLock := &sync.Mutex{}
+	if actual, loaded := g.writeMu.LoadOrStore(key, writeLock); loaded {
+		writeLock = actual.(*sync.Mutex)
+	}
+	writeLock.Lock()
+	
+	// 修复：使用 defer 确保锁一定被释放
+	defer func() {
+		writeLock.Unlock()
+		// 清理写锁（避免内存泄漏）
+		g.writeMu.Delete(key)
+	}()
+	
+	// 1. 更新数据源
+	if err := g.getter.Set(key, value); err != nil {
+		return fmt.Errorf("failed to update data source: %v", err)
 	}
 	
-	// 2. 检查 MainCache
-	if v, ok := g.mainCache.get(key); ok {
-		log.Println("[GeeCache] main cache hit")
-		return v, nil
+	// 2. 更新本地缓存
+	byteValue := ByteView{b: cloneBytes(value)}
+	g.populateCache(key, byteValue)
+	
+	// 3. 修复：只有热点数据才写入 Redis
+	//    判断标准：key 是否已在 hotCache 中，或访问统计是否达到热点阈值
+	isHot := g.isHotKey(key)
+	if g.redisClient != nil && isHot {
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer cancel()
+		ttl := g.calcTTL(key) + 10*time.Minute
+		
+		// 最多重试 3 次
+		var err error
+		for i := 0; i < 3; i++ {
+			err = g.redisClient.Set(ctx, key, value, ttl).Err()
+			if err == nil {
+				log.Printf("[Redis] 更新热点缓存成功 %s", key)
+				break
+			}
+			log.Printf("[Redis] 更新热点缓存失败 %s (尝试 %d/3): %v", key, i+1, err)
+			time.Sleep(100 * time.Millisecond)
+		}
+		if err != nil {
+			log.Printf("[Redis] 更新热点缓存最终失败 %s: %v", key, err)
+		}
+	} else if g.redisClient != nil {
+		log.Printf("[Redis] 跳过非热点数据 %s，不写入 Redis", key)
 	}
-	value, err := g.quiet_load(key)
-	if err != nil {
-		return ByteView{}, err
-	}
-	return value, nil
+	
+	// 4. 广播缓存失效到集群其他节点
+	go g.broadcastInvalidate(key)
+	
+	log.Printf("[Update] Key %s updated successfully", key)
+	return nil
 }
 
+// 新增：Delete 方法 - 删除数据并保持缓存一致性
+func (g *Group) Delete(key string) error {
+	if key == "" {
+		return fmt.Errorf("key is required")
+	}
+	
+	// 修复：只有 owner 节点才执行完整的删除流程
+	if !g.isOwner(key) {
+		// 非 owner 节点：转发删除请求到 owner 节点
+		if g.peers != nil {
+			if peer, ok := g.peers.PickPeer(key); ok {
+				if client, ok := peer.(*Client); ok {
+					return client.Invalidate(key, g.name)
+				}
+			}
+		}
+		// 无法转发，降级处理
+		log.Printf("[Delete] Non-owner node %s cannot forward delete for %s", g.name, key)
+		return nil
+	}
+	
+	// 1. 删除数据源
+	if err := g.getter.Delete(key); err != nil {
+		return fmt.Errorf("failed to delete data source: %v", err)
+	}
+	
+	// 2. 删除本地缓存
+	g.DeleteLocalCache(key)
+	
+	// 3. 删除 Redis 缓存（只有 owner 节点执行）
+	if g.redisClient != nil && g.isOwner(key) {
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		defer cancel()
+		if err := g.redisClient.Del(ctx, key).Err(); err != nil {
+			log.Printf("[Redis] 删除缓存失败 %s: %v", key, err)
+		} else {
+			log.Printf("[Redis] 删除缓存成功 %s (owner node)", key)
+		}
+	}
+	
+	// 4. 广播缓存失效到集群其他节点
+	go g.broadcastInvalidate(key)
+	
+	log.Printf("[Delete] Key %s deleted successfully", key)
+	return nil
+}
+
+// 新增：DeleteLocalCache - 删除本地缓存（不广播）
+func (g *Group) DeleteLocalCache(key string) {
+	g.mainCache.delete(key)
+	g.hotCache.delete(key)
+	// 从布隆过滤器中移除（如果需要）
+	// 注意：标准布隆过滤器不支持删除，这里仅记录日志
+	log.Printf("[LocalCache] Key %s removed from local cache", key)
+}
+
+// 新增：UpdateLocalCache - 更新本地缓存（不广播）
+func (g *Group) UpdateLocalCache(key string, value []byte) {
+	byteValue := ByteView{b: cloneBytes(value)}
+	g.populateCache(key, byteValue)
+	log.Printf("[LocalCache] Key %s updated in local cache", key)
+}
+
+// 新增：broadcastInvalidate - 广播缓存失效到集群所有节点
+func (g *Group) broadcastInvalidate(key string) {
+	if g.peers == nil {
+		// 单机模式，不需要广播
+		return
+	}
+	
+	// 获取所有节点地址，通知它们失效
+	if server, ok := g.peers.(*Server); ok {
+		// 如果是 Server 类型，可以获取所有 clients
+		server.mu.Lock()
+		clientsCopy := make(map[string]*Client)
+		for addr, client := range server.clients {
+			clientsCopy[addr] = client
+		}
+		server.mu.Unlock()
+		
+		// 遍历所有 peer，通知它们失效（排除自己）
+		for addr, client := range clientsCopy {
+			if client == nil || addr == server.self {
+				continue
+			}
+			go func(a string, c *Client) {
+				err := c.Invalidate(key, g.name)
+				if err != nil {
+					log.Printf("[Broadcast] Failed to invalidate %s on %s: %v", key, a, err)
+				}
+			}(addr, client)
+		}
+	}
+}
 
 func (g *Group) load(key string) (value ByteView, err error) {
 	// each key is only fetched once (either locally or remotely)
@@ -319,7 +469,7 @@ func (g *Group) getFromPeer(peer PeerGetter, key string) (ByteView, error) {
 		return ByteView{}, err
 	}
 
-	value := ByteView{b: res.Value}
+	value := ByteView{b: cloneBytes(res.Value)}
 	// log.Println("[Get] already get", err)
 	g.updateKeyStats(key, value)
 
@@ -523,19 +673,21 @@ func (g *Group) checkPrefetch(currentKey string) {
 	g.mu.Unlock()
 	if prev != -1 && prev+1 == seq {
         // 根据网速决定预取数量
-        prefetchCount := 2  // 默认2个
-        if g.currentBandwidth > 0 && g.currentBandwidth < 0.5 {
+        prefetchCount := 2  // 默认 2 个
+        // 修复：使用原子操作读取带宽（Uint64+Float64bits）
+        bandwidth := math.Float64frombits(g.currentBandwidth.Load())
+        if bandwidth > 0 && bandwidth < 0.5 {
 			return
 		}
-        if g.currentBandwidth > 10 {       
-            prefetchCount = 5                // 激进预取5个
-            log.Printf("[Adaptive] Fast network (%.2fMB/s), prefetch 5 segments", g.currentBandwidth)
-        } else if g.currentBandwidth > 2 {   // 网速 2-10MB/s
-            prefetchCount = 3                // 正常预取3个
-            log.Printf("[Adaptive] Normal network (%.2fMB/s), prefetch 3 segments", g.currentBandwidth)
-        } else if g.currentBandwidth > 0 {   // 网速 < 2MB/s
-            prefetchCount = 1                // 保守预取1个
-            log.Printf("[Adaptive] Slow network (%.2fMB/s), prefetch only 1 segment", g.currentBandwidth)
+        if bandwidth > 10 {       
+            prefetchCount = 5                // 激进预取 5 个
+            log.Printf("[Adaptive] Fast network (%.2fMB/s), prefetch 5 segments", bandwidth)
+        } else if bandwidth > 2 {   // 网速 2-10MB/s
+            prefetchCount = 3                // 正常预取 3 个
+            log.Printf("[Adaptive] Normal network (%.2fMB/s), prefetch 3 segments", bandwidth)
+        } else if bandwidth > 0 {   // 网速 < 2MB/s
+            prefetchCount = 1                // 保守预取 1 个
+            log.Printf("[Adaptive] Slow network (%.2fMB/s), prefetch only 1 segment", bandwidth)
         } else {
             log.Printf("[Adaptive] Unknown bandwidth, use default prefetch 2")
         }
@@ -555,10 +707,12 @@ func (g *Group) checkPrefetch(currentKey string) {
             go func(k string) {
                 // 如果网速慢，预取也放慢（避免抢占带宽）
 					defer func() { <-g.prefetchSem }()
-					if g.currentBandwidth < 1 && g.currentBandwidth > 0 {
-						time.Sleep(500 * time.Millisecond)  // 慢网时延迟500ms再预取
+					// 修复：使用原子操作读取带宽（Uint64+Float64bits）
+					if math.Float64frombits(g.currentBandwidth.Load()) < 1 && math.Float64frombits(g.currentBandwidth.Load()) > 0 {
+						time.Sleep(500 * time.Millisecond)  // 慢网时延迟 500ms 再预取
 					}
-					_, _ = g.Get_pred(k)
+					// 修复：将 Get_pred 替换为 quiet_load
+					_, _ = g.quiet_load(k)
 				}(nextKey)
 			default:
 				log.Printf("[Prefetch] Semaphore full, skip %s", nextKey)
@@ -585,7 +739,7 @@ func (g *Group) StartPrewarmWorker() {
 
 // runPrewarm 执行具体的预热逻辑
 func (g *Group) runPrewarm() {
-    // 策略：确保所有视频的片头（前3个）永远在缓存中（冷启动保护）
+    // 策略：确保所有视频的片头（前 3 个）永远在缓存中（冷启动保护）
     g.mu.RLock()
     vidPrefixes := make([]string, 0, len(g.videoMetaMap))
     for vid := range g.videoMetaMap {
@@ -600,7 +754,8 @@ func (g *Group) runPrewarm() {
 				continue
 			}
 			if _, ok := g.mainCache.get(key); !ok {
-				g.Get_pred(key)
+				// 修复：将 Get_pred 替换为 quiet_load
+				g.quiet_load(key)
 }
         }
     }
@@ -665,3 +820,34 @@ func (g *Group) calcTTL(key string) time.Duration {
 	return 5 * time.Minute
 }
 
+// 新增：isHotKey - 判断 key 是否为热点数据
+func (g *Group) isHotKey(key string) bool {
+	// 1. 检查是否在 hotCache 中
+	if _, ok := g.hotCache.get(key); ok {
+		return true
+	}
+	
+	// 2. 检查访问统计是否达到热点阈值
+	g.mu.RLock()
+	stat, exists := g.keys[key]
+	g.mu.RUnlock()
+	
+	if !exists {
+		return false
+	}
+	
+	// 计算 QPS
+	firstGetTime := stat.firstGetTime
+	currentCount := stat.remoteCnt.Get()
+	threshold := int64(defaultMaxMinuteRemoteQPS)
+	
+	// 片头片尾阈值减半
+	if g.isHead(key) || g.isTail(key) || g.isM3U8(key) {
+		threshold = threshold / 2
+	}
+	
+	interval := math.Max(1, float64(time.Now().Unix()-firstGetTime.Unix())/60)
+	qps := currentCount / int64(math.Round(interval))
+	
+	return qps >= threshold
+}

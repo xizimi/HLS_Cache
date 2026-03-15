@@ -7,6 +7,8 @@ option go_package = "./";
 message Request {
     string group = 1;
     string key = 2;
+    // 新增：用于更新操作的值
+    bytes value = 3;
 }
 
 message Response {
@@ -15,4 +17,8 @@ message Response {
 
 service GroupCache {
     rpc Get(Request) returns (Response);
+    // 缓存失效接口
+    rpc Invalidate(Request) returns (Response);
+    // 更新接口
+    rpc Update(Request) returns (Response);
 }

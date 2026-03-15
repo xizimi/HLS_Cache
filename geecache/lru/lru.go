@@ -141,3 +141,10 @@ func (c *Cache) RemoveElement(ele *list.Element) {
 	}
 
 }
+
+// Remove 函数用于根据 key 删除缓存项
+func (c *Cache) Remove(key string) {
+	if ele, ok := c.cache[key]; ok {
+		c.RemoveElement(ele)
+	}
+}
